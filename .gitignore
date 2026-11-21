@@ -1,0 +1,10 @@
+/build/
+/dev/
+/dev-answer/
+/out/
+/datasets/
+/scratch/
+.gstack/
+__pycache__/
+.venv/
+.DS_Store
