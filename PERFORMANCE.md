@@ -1,6 +1,10 @@
 # Shopping Sessions performance
 
-The target is the 1.24 s practice score. Local timings use the native ARM64
+The latest reported practice score is 1.44 s, and the time to beat is
+1.17 s. See [the research memo](OPTIMIZATION_RESEARCH.md) for the 1.10 s
+engineering target, paper-by-paper analysis, and prototype results.
+
+Local timings use the native ARM64
 release executable on an Apple M1 with eight workers. They include process
 startup and closing the Parquet output. The Linux/amd64 image is checked
 locally under emulation. A score or runtime on a native N2 machine requires
