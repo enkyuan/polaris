@@ -6,34 +6,37 @@ namespace {
 
 template<typename Kernel>
 void parse_events(Range range, const Clock& clock, const Catalog& catalog,
-                  const CandidateLayout& layout, Input& input) {
+                  const EventLayout& layout, Input& input) {
+    // About 68 years on either side of the manifest start fit inline.
+    const auto order_origin = clock.begin / 1000 - (Time{1} << 31);
     scan_csv<7>(range, Kernel{}, [&](const auto& fields) {
         if (fields[0].empty()) return;
         const auto id = input.keys.pack(fields[0]);
-        const auto received = clock.ingest(fields[3]);
+        const auto received = clock.ingest_seconds(fields[3]);
         if (received == bad_time) return;
-        EventCandidate candidate{id, 0, received, none, 0};
+        auto position = Input::no_position;
         if (!fields[1].empty() && !fields[5].empty()) {
             const auto kind = fields[4];
             const bool purchase = kind == "purchase";
             if (purchase || kind == "view" || kind == "cart") {
                 const auto time = clock.parse(fields[2]);
-                if (time >= clock.begin && time < clock.end && received - time <= day_ms) {
+                if (time >= clock.begin && time < clock.end && received * 1000 - time <= day_ms) {
                     const auto price = purchase ? price_cents(fields[6]) : 0;
                     if (!purchase || price) {
-                        candidate.user = input.keys.pack(fields[1]);
-                        candidate.time = layout.store_time(time, input);
+                        const auto user = input.keys.pack(fields[1]);
+                        OffsetEvent value{layout.store_time(time, input), 0};
                         if (purchase) {
                             const auto category = static_cast<std::uint32_t>(
                                 catalog.products.get(input.keys.pack(fields[5]), catalog.unknown));
-                            candidate.purchase = layout.store_purchase({price, category}, input);
+                            value.purchase = layout.store_purchase({price, category}, input);
                         }
+                        position = input.append(user, value);
                     }
                 }
             }
         }
         // Invalid payloads remain eligible to win the earliest-ingest comparison.
-        input.candidates[bin_for(id)].push_back(candidate);
+        input.remember(id, received - order_origin, position);
     });
 }
 

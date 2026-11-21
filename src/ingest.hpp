@@ -19,23 +19,68 @@ inline std::pair<Key, std::size_t> person_bin(const Aliases& aliases, Key user) 
 template<typename T>
 using Bins = std::array<std::vector<T>, partition_count>;
 
-struct EventCandidate {
-    Key id, user;
-    Time ingest;
-    std::uint32_t time, purchase;
+struct RawEvent {
+    Key user;
+    OffsetEvent value;
+};
+
+// Deduplication reads ID and version metadata. Event payloads stay in
+// raw-user buckets until grouping.
+struct EventVersion {
+    Key id;
+    std::uint32_t order, position;
+};
+
+struct VersionLocation {
+    Time order;
+    std::size_t position;
 };
 
 struct Input {
+    static constexpr auto no_position = SIZE_MAX;
+
     Keys keys;
-    Bins<EventCandidate> candidates;
+    Bins<EventVersion> versions;
+    Bins<RawEvent> events;
     Bins<Click> clicks;
+    std::vector<VersionLocation> wide_versions;
     std::vector<Time> wide_times;
     std::vector<Purchase> wide_purchases;
-};
 
-// Keep the common candidate at 32 bytes. Wider manifests and catalogs use
-// side arrays, so the compact representation never restricts input values.
-struct CandidateLayout {
+    std::size_t append(Key user, OffsetEvent value) {
+        const auto bin = bin_for(user);
+        auto& bucket = events[bin];
+        const auto position = (bucket.size() << partition_bits) | bin;
+        bucket.push_back({user, value});
+        return position;
+    }
+
+    void remember(Key id, Time order, std::size_t position) {
+        auto& bucket = versions[bin_for(id)];
+        if (static_cast<std::uint64_t>(order) < none &&
+            (position < none || position == no_position)) {
+            bucket.push_back({id, static_cast<std::uint32_t>(order), static_cast<std::uint32_t>(position)});
+        } else {
+            const auto index = static_cast<std::uint32_t>(wide_versions.size());
+            wide_versions.push_back({order, position});
+            bucket.push_back({id, none, index});
+        }
+    }
+
+    [[nodiscard]] VersionLocation locate(const EventVersion& version) const {
+        if (version.order == none) return wide_versions[version.position];
+        return {version.order, version.position == none ? no_position : version.position};
+    }
+
+    void discard(std::size_t position) {
+        if (position == no_position) return;
+        events[position & (partition_count - 1)][position >> partition_bits].value.time = none;
+    }
+};
+static_assert(sizeof(EventVersion) == 16 && sizeof(RawEvent) == 16);
+
+// Side arrays preserve the full range of times and categories.
+struct EventLayout {
     Time origin;
     bool wide_time, wide_purchase;
 
@@ -63,7 +108,7 @@ struct CandidateLayout {
 };
 
 struct IngestKernels {
-    void (*events)(Range, const Clock&, const Catalog&, const CandidateLayout&, Input&);
+    void (*events)(Range, const Clock&, const Catalog&, const EventLayout&, Input&);
     void (*clicks)(Range, const Clock&, const Catalog&, const Aliases&, Input&);
     std::uint64_t (*structure)(Range, unsigned);
 };

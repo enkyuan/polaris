@@ -54,11 +54,54 @@ def compare_case(command, window_start, categories):
         }
         env = dict(os.environ, DATA_DIR=str(data), OUTPUT_DIR=str(out))
         subprocess.run([*command, data, out], env=env, check=True)
-        for table, schema in SCHEMAS.items():
-            csv = base / (table + ".csv")
-            csv.write_text(expected[table])
-            if rows(load_actual(out / table, schema)) != rows(load_expected(csv, schema)):
-                raise SystemExit(f"{table} differs for {window_start} with {categories} categories")
+        compare_tables(base, out, expected, f"{window_start} with {categories} categories")
+
+
+def compare_tables(base, out, expected, case):
+    for table, schema in SCHEMAS.items():
+        csv = base / (table + ".csv")
+        csv.write_text(expected[table])
+        if rows(load_actual(out / table, schema)) != rows(load_expected(csv, schema)):
+            raise SystemExit(f"{table} differs for {case}")
+
+
+def compare_versions_and_slices(command):
+    with tempfile.TemporaryDirectory() as folder:
+        base = Path(folder)
+        data, out = base / "data", base / "out"
+        write_input(data, "2026-10-01", 2)
+        header = "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n"
+        (data / "events" / "part.csv").write_text(
+            header
+            + "best,v,2026-10-03T10:00:00Z,2026-10-03T10:00:00Z,view,p000,\n"
+            + "suppress,u,2026-10-03T10:30:00Z,2026-10-03T10:30:00Z,purchase,p001,900\n"
+            + "edge,u,2026-10-03T10:30:00Z,2026-10-03T10:30:00Z,view,p000,\n"
+        )
+        (data / "events" / "part-2.csv").write_text(
+            header
+            + "best,long-device-id,2026-10-03T10:00:00Z,1830-10-03T10:00:00Z,purchase,p000,700\n"
+            + "best,x,2026-10-03T11:00:00Z,2199-10-03T10:00:00Z,purchase,p001,500\n"
+            + "suppress,x,bad,1830-10-03T10:00:00Z,view,p000,\n"
+        )
+        (data / "clicks" / "part.csv").write_text(
+            "click_id,user_id,campaign_id,ts\n"
+            "k1,u,c_1,2026-10-03T10:00:00Z\n"
+            "k2,long-device-id,c_2,2026-10-03T09:30:00Z\n"
+        )
+        expected = {
+            "user_daily": (
+                "user_id,day,sessions,events,revenue_cents,top_category\n"
+                "long-device-id,2026-10-03,1,2,700,category000\n"
+            ),
+            "campaign_daily": (
+                "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n"
+                "c_1,search,2026-10-03,1,1,700,1\n"
+                "c_2,social,2026-10-03,0,0,0,1\n"
+            ),
+        }
+        env = dict(os.environ, DATA_DIR=str(data), OUTPUT_DIR=str(out))
+        subprocess.run([*command, data, out], env=env, check=True)
+        compare_tables(base, out, expected, "wide ingest order and merged user slices")
 
 
 def main(command):
@@ -67,7 +110,8 @@ def main(command):
     for start in ("2026-10-01", "2026-08-01"):
         for categories in (255, 256):
             compare_case(command, start, categories)
-    print("4/4 record layout checks passed")
+    compare_versions_and_slices(command)
+    print("5/5 record layout checks passed")
 
 
 if __name__ == "__main__":

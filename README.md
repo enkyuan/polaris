@@ -32,7 +32,8 @@ make check-dev
 Pass `-DPOLARIS_SANITIZE=ON` to CMake for an AddressSanitizer and
 UndefinedBehaviorSanitizer build.
 Run `python3 scripts/check_record_layouts.py build/shopping-sessions` to check
-the timestamp and category limits of the compact representation.
+the timestamp, category, and ingest-version limits of the compact
+representation and the merge of linked-user spans.
 
 ## Benchmark
 
@@ -59,12 +60,13 @@ See [PERFORMANCE.md](PERFORMANCE.md) for the measurements and design decisions.
 ## Pipeline
 
 - Schedule newline-aligned input ranges dynamically. Resolve connected
-  components while event reads proceed, then map clicks and event winners to
-  the byte-wise minimum person ID. A membership bitmap avoids exact alias-map
-  probes for IDs that are definitely absent.
-- Bucket events by ID. Resolve repeated fingerprints by exact key equality
-  and ingest time, retaining invalid payloads until the earliest copy is known.
-- Group winning events and valid clicks into per-person spans. Sort those
+  components while event reads proceed. A membership bitmap avoids exact
+  alias-map probes for IDs that are definitely absent.
+- Store event versions by ID and payloads by raw user. Resolve repeated
+  fingerprints by exact key equality and earliest ingest time. Invalid
+  payloads still participate in version selection.
+- Group winning event payloads into raw-user spans and resolve each span's owner
+  to the byte-wise minimum linked ID. Combine spans and clicks by person. Sort those
   spans by timestamp, sessionize in one pass, and roll up campaign assists
   from the union of each campaign’s ranges of session starts. Keep event
   timestamps and purchases compact through timeline sorting when they fit.

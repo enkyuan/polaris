@@ -107,9 +107,10 @@ class Clock {
 public:
     explicit Clock(const fs::path& manifest);
     [[nodiscard]] Time parse(std::string_view value) const;
-    [[nodiscard]] Time ingest(std::string_view value) const;
+    [[nodiscard]] Time ingest_seconds(std::string_view value) const;
     Time begin{}, end{};
 private:
+    [[nodiscard]] int civil_day(const char* p) const;
     struct CivilDay {
         std::uint64_t prefix;
         std::uint16_t suffix;

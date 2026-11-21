@@ -1,8 +1,9 @@
 # Shopping Sessions performance
 
-The latest reported practice score is 1.44 s, and the time to beat is
-1.17 s. See [the research memo](OPTIMIZATION_RESEARCH.md) for the 1.10 s
-engineering target, paper-by-paper analysis, and prototype results.
+The latest reported practice score is 1.41 s, and the time to beat is
+1.17 s. The previous 1.44 s result used the same runtime source. See
+[the research memo](OPTIMIZATION_RESEARCH.md) for the 1.10 s engineering
+target and paper-by-paper analysis.
 
 Local timings use the native ARM64
 release executable on an Apple M1 with eight workers. They include process
@@ -201,3 +202,54 @@ over the selected change in the local comparisons. The Linux/amd64
 image and the native M1 build passed the organizer fixtures, the four
 record-layout checks, and the public dev comparison. Native N2 timing
 still needs a run on that hardware.
+
+## Split event versions from payloads
+
+The new path writes a 16-byte version record to an event-ID bucket and
+a 16-byte payload to a raw-user bucket during parsing. The deduplication
+passes touch only the smaller version stream. They mark losing copies in
+place, including copies submitted under a different user ID. The old
+path read 32-byte candidates and wrote a second 16-byte payload for
+every winner.
+
+Whole-second ingest order and payload positions fit in the inline
+version record on ordinary inputs. A side array stores full-width
+values when either field exceeds its inline range. A structurally valid
+version with an invalid payload has no position and can still suppress
+a later valid copy.
+
+Workers group surviving payloads into raw-user spans. They look up
+the canonical person once per raw user and route that span to its
+final partition. A person with multiple raw-user spans combines only
+those spans. A person with one span sorts it in place. Readers and
+identity resolution still run concurrently.
+
+Two interim designs routed events to their canonical person during
+parsing. Waiting for the link map exposed startup latency. Buffering
+early rows restored overlap but added an extra routing pass. Both
+variants slowed the full local run despite a faster deduplication pass.
+The raw-user span path moves alias lookup out of the row loop and
+keeps parsing independent of link resolution.
+
+The final build was tested on the M1 with eight workers and six
+interleaved, warmed runs per build on each generated practice seed.
+Both runs wrote full Parquet output.
+
+| 20M-event seed | Control median wall | New median wall | Control → new median user CPU |
+| --- | ---: | ---: | ---: |
+| 17 | 1.005 s | 0.895 s | 5.45 → 5.00 s |
+| 41 | 0.955 s | 0.860 s | 5.25 → 4.84 s |
+
+On seed 17, the median of the old combined deduplication and routing
+phase was 223 ms. The new deduplication and raw-user grouping phases
+had respective medians of 67 ms and 76 ms. These are diagnostics on
+ARM64. The N2 target for this iteration is 1.21–1.31 s against the
+reported 1.41 s baseline.
+
+The sanitizer build and the Linux/amd64 container passed all 36
+official fixtures, five layout checks, and the public dev answer. The
+container used the scalar scanner under ARM-hosted emulation. Both
+20M-event seeds matched the control row for row. The 60M-event seed 29
+matched 6,639,553 user rows and 28,014 campaign rows, with 6.42 GB
+peak resident memory on the local process. See
+`scratch/direct-routing.jvF0EP/` for local timing and verification logs.

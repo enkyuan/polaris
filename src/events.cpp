@@ -11,19 +11,6 @@
 namespace shop {
 namespace {
 
-template<typename Record>
-struct PersonEvent {
-    Key person;
-    Record value;
-};
-
-template<typename Record>
-struct Output {
-    Bins<PersonEvent<Record>> events;
-};
-
-static_assert(sizeof(PersonEvent<OffsetEvent>) == 16 && sizeof(OffsetEvent) == 8);
-
 class Phases {
 public:
     explicit Phases(bool enabled) : enabled_(enabled) {}
@@ -39,69 +26,64 @@ private:
     std::chrono::steady_clock::time_point last_ = std::chrono::steady_clock::now();
 };
 
-template<typename Record>
-void deduplicate(std::size_t bin, std::vector<Input>& inputs, Output<Record>& output,
-                 const Aliases& aliases, const CandidateLayout& layout) {
+void deduplicate(std::size_t bin, std::vector<Input>& inputs) {
     std::size_t count = 0;
-    for (const auto& in : inputs) count += in.candidates[bin].size();
+    for (const auto& in : inputs) count += in.versions[bin].size();
     if (!count) return;
     const auto bits = std::bit_ceil(std::max<std::size_t>(64, count * 16));
     const auto mask = bits - 1;
     std::vector<std::uint64_t> seen(bits / 64), repeat(bits / 64);
     const auto fingerprint = [&](Key id) { return (KeyHash{}(id) >> partition_bits) & mask; };
     const auto visit = [&](auto&& f) {
-        for (const auto& in : inputs) {
-            for (const auto& row : in.candidates[bin]) f(in, row);
+        for (auto& in : inputs) {
+            for (const auto& row : in.versions[bin]) f(in, row);
         }
     };
-    visit([&](const Input&, const EventCandidate& row) {
+    visit([&](const Input&, const EventVersion& row) {
         const auto slot = fingerprint(row.id);
         const auto bit = std::uint64_t{1} << (slot % 64);
         repeat[slot / 64] |= seen[slot / 64] & bit;
         seen[slot / 64] |= bit;
     });
-    const auto emit = [&](const Input& in, const EventCandidate& row) {
-        if (row.time == none) return;
-        const auto [person, target] = person_bin(aliases, row.user);
-        if constexpr (std::same_as<Record, OffsetEvent>) {
-            output.events[target].push_back({person, {row.time, row.purchase}});
-        } else {
-            const auto [price, category] = layout.read_purchase(row.purchase, in);
-            output.events[target].push_back({person, {layout.read_time(row.time, in), price, category}});
-        }
-    };
     KeyIndex ambiguous(count / 8);
-    struct Winner { const Input* in; const EventCandidate* row; };
+    struct Winner {
+        Input* in;
+        VersionLocation location;
+    };
     std::vector<Winner> winners;
     winners.reserve(count / 8);
-    visit([&](const Input& in, const EventCandidate& row) {
+    visit([&](Input& in, const EventVersion& row) {
         const auto slot = fingerprint(row.id);
-        if (((repeat[slot / 64] >> (slot % 64)) & 1) == 0) {
-            emit(in, row);
+        if (!((repeat[slot / 64] >> (slot % 64)) & 1)) return;
+        const auto [i, inserted] = ambiguous.insert(row.id, winners.size());
+        const auto location = in.locate(row);
+        if (inserted) {
+            winners.push_back({&in, location});
+            return;
+        }
+        auto& winner = winners[i];
+        // Only this ID partition can discard these payload locations.
+        if (location.order < winner.location.order) {
+            winner.in->discard(winner.location.position);
+            winner = {&in, location};
         } else {
-            const auto [i, inserted] = ambiguous.insert(row.id, winners.size());
-            if (inserted) winners.push_back({&in, &row});
-            else if (row.ingest < winners[i].row->ingest) winners[i] = {&in, &row};
+            in.discard(location.position);
         }
     });
-    for (const auto& [in, row] : winners) emit(*in, *row);
-    for (auto& in : inputs) std::vector<EventCandidate>().swap(in.candidates[bin]);
+    for (auto& in : inputs) std::vector<EventVersion>().swap(in.versions[bin]);
 }
 
-struct PersonGroup {
+struct RawGroup {
     Key key;
-    std::size_t events{}, clicks{};
-    std::size_t event_end{}, click_end{};
+    std::size_t count{}, end{};
 };
 
-class BinPeople {
+class RawUsers {
 public:
-    explicit BinPeople(std::size_t event_count)
+    explicit RawUsers(std::size_t event_count)
         : ids_(std::max<std::size_t>(32, event_count / 16), partition_bits) {
         groups.reserve(event_count / 24);
     }
-
-    std::uint32_t find(Key key) const { return static_cast<std::uint32_t>(ids_.get(key, none)); }
 
     std::uint32_t add(Key key) {
         const auto [group, inserted] = ids_.insert(key, groups.size());
@@ -109,7 +91,7 @@ public:
         return static_cast<std::uint32_t>(group);
     }
 
-    std::vector<PersonGroup> groups;
+    std::vector<RawGroup> groups;
 private:
     KeyIndex ids_;
 };
@@ -162,67 +144,132 @@ private:
 };
 
 template<typename Record>
-struct GroupingBuffers {
-    std::vector<std::uint32_t> event_groups, click_groups;
-    RecordBuffer<Record> events;
-    RecordBuffer<TimedClick> clicks;
-    std::vector<Record> sort_scratch;
+struct PersonSlice {
+    Key person;
+    std::span<Record> events;
 };
 
 template<typename Record>
-void process_bin(std::size_t bin, std::vector<Input>& input, std::vector<Output<Record>>& output,
-                 const Clock& clock, Timeline& timeline, GroupingBuffers<Record>& buffers,
-                 UserWriter& writer, CampaignTotals& totals) {
-    std::size_t event_count = 0, click_count = 0;
-    for (const auto& source : output) event_count += source.events[bin].size();
+struct EventBatch {
+    RecordBuffer<Record> records;
+    // Disjoint slices stay in one allocation while their canonical
+    // partitions sort and consume them independently.
+    Bins<PersonSlice<Record>> destinations;
+};
+
+template<typename Record>
+void group_raw_events(std::size_t bin, std::vector<Input>& input, const EventLayout& layout,
+                      const Aliases& aliases, std::vector<std::uint32_t>& assignments,
+                      EventBatch<Record>& batch) {
+    std::size_t count = 0;
+    for (const auto& source : input) count += source.events[bin].size();
+    if (!count) return;
+
+    RawUsers people(count);
+    auto& groups = people.groups;
+    assignments.clear();
+    assignments.reserve(count);
+    for (const auto& source : input) {
+        for (const auto& event : source.events[bin]) {
+            if (event.value.time == none) continue;
+            const auto group = people.add(event.user);
+            ++groups[group].count;
+            assignments.push_back(group);
+        }
+    }
+    if (assignments.empty()) {
+        for (auto& source : input) std::vector<RawEvent>().swap(source.events[bin]);
+        return;
+    }
+
+    auto* records = batch.records.resize_for_write(assignments.size());
+    std::size_t offset = 0;
+    for (auto& group : groups) {
+        const auto [person, target] = person_bin(aliases, group.key);
+        batch.destinations[target].push_back({person, {records + offset, group.count}});
+        group.end = offset;
+        offset += group.count;
+    }
+
+    std::size_t i = 0;
+    for (auto& source : input) {
+        for (const auto& event : source.events[bin]) {
+            if (event.value.time == none) continue;
+            auto& pos = groups[assignments[i++]].end;
+            if constexpr (std::same_as<Record, OffsetEvent>) {
+                records[pos++] = event.value;
+            } else {
+                const auto [price, category] = layout.read_purchase(event.value.purchase, source);
+                records[pos++] = {layout.read_time(event.value.time, source), price, category};
+            }
+        }
+        std::vector<RawEvent>().swap(source.events[bin]);
+    }
+}
+
+template<typename Record>
+struct TimelineGroup {
+    PersonSlice<Record> first;
+    std::uint32_t more = none;
+    std::size_t events = 0, clicks = 0, click_end = 0;
+};
+
+template<typename Record>
+struct GroupingBuffers {
+    std::vector<std::uint32_t> click_groups;
+    RecordBuffer<TimedClick> clicks;
+    std::vector<Record> merged_events, sort_scratch;
+};
+
+template<typename Record>
+void write_person_bin(std::size_t bin, std::vector<Input>& input, std::vector<EventBatch<Record>>& batches,
+                      const Clock& clock, Timeline& timeline, GroupingBuffers<Record>& buffers,
+                      UserWriter& writer, CampaignTotals& totals) {
+    std::size_t slice_count = 0, click_count = 0;
+    for (const auto& batch : batches) slice_count += batch.destinations[bin].size();
     for (const auto& source : input) click_count += source.clicks[bin].size();
-    if (!event_count) {
+    if (!slice_count) {
         for (auto& source : input) std::vector<Click>().swap(source.clicks[bin]);
         return;
     }
 
-    BinPeople people(event_count);
-    auto& groups = people.groups;
-    auto& event_groups = buffers.event_groups;
-    auto& click_groups = buffers.click_groups;
-    event_groups.clear();
-    click_groups.clear();
-    event_groups.reserve(event_count);
-    click_groups.reserve(click_count);
-    for (const auto& source : output) {
-        for (const auto& event : source.events[bin]) {
-            const auto group = people.add(event.person);
-            ++groups[group].events;
-            event_groups.push_back(group);
+    struct ExtraSlice { std::span<Record> events; std::uint32_t next; };
+    KeyIndex people(slice_count, partition_bits);
+    std::vector<TimelineGroup<Record>> groups;
+    std::vector<ExtraSlice> extra;
+    groups.reserve(slice_count);
+    for (const auto& batch : batches) {
+        for (const auto& slice : batch.destinations[bin]) {
+            const auto [index, inserted] = people.insert(slice.person, groups.size());
+            if (inserted) {
+                groups.push_back({slice, none, slice.events.size()});
+            } else {
+                auto& group = groups[index];
+                extra.push_back({slice.events, group.more});
+                group.more = static_cast<std::uint32_t>(extra.size() - 1);
+                group.events += slice.events.size();
+            }
         }
     }
+
+    auto& click_groups = buffers.click_groups;
+    click_groups.clear();
+    click_groups.reserve(click_count);
     for (const auto& source : input) {
         for (const auto& click : source.clicks[bin]) {
-            const auto group = people.find(click.person);
+            const auto group = static_cast<std::uint32_t>(people.get(click.person, none));
             if (group != none) ++groups[group].clicks;
             click_groups.push_back(group);
         }
     }
-
-    std::size_t event_offset = 0, click_offset = 0;
+    std::size_t click_offset = 0;
     for (auto& group : groups) {
-        group.event_end = event_offset;
         group.click_end = click_offset;
-        event_offset += group.events;
         click_offset += group.clicks;
     }
 
-    auto* event_records = buffers.events.resize_for_write(event_offset);
     auto* click_records = buffers.clicks.resize_for_write(click_offset);
     std::size_t i = 0;
-    for (auto& source : output) {
-        for (const auto& event : source.events[bin]) {
-            auto& pos = groups[event_groups[i++]].event_end;
-            event_records[pos++] = event.value;
-        }
-        std::vector<PersonEvent<Record>>().swap(source.events[bin]);
-    }
-    i = 0;
     for (auto& source : input) {
         for (const auto& click : source.clicks[bin]) {
             const auto group = click_groups[i++];
@@ -231,26 +278,44 @@ void process_bin(std::size_t bin, std::vector<Input>& input, std::vector<Output<
         std::vector<Click>().swap(source.clicks[bin]);
     }
 
+    auto& merged = buffers.merged_events;
     for (const auto& group : groups) {
-        const std::span events(event_records + group.event_end - group.events, group.events);
+        auto events = group.first.events;
+        if (group.more != none) {
+            merged.clear();
+            merged.reserve(group.events);
+            merged.insert(merged.end(), events.begin(), events.end());
+            for (auto next = group.more; next != none; next = extra[next].next) {
+                const auto span = extra[next].events;
+                merged.insert(merged.end(), span.begin(), span.end());
+            }
+            events = merged;
+        }
         const std::span clicks(click_records + group.click_end - group.clicks, group.clicks);
         std::sort(clicks.begin(), clicks.end(), [](const auto& a, const auto& b) {
             if (a.time != b.time) return a.time < b.time;
             return KeyLess{}(a.id, b.id);
         });
-        timeline.run(group.key, sort_events(events, buffers.sort_scratch, clock), clicks, clock.begin, writer, totals);
+        timeline.run(group.first.person, sort_events(events, buffers.sort_scratch, clock), clicks, clock.begin,
+                     writer, totals);
     }
 }
 
 template<typename Record>
-void finish(std::vector<Input>& input, const Aliases& aliases, const CandidateLayout& layout,
+void finish(std::vector<Input>& input, const Aliases& aliases, const EventLayout& layout,
             const Clock& clock, const Catalog& catalog, const fs::path& out,
             unsigned threads, Phases& phases) {
-    std::vector<Output<Record>> output(threads);
-    parallel(partition_count, threads, [&](auto worker, auto bin) {
-        deduplicate(bin, input, output[worker], aliases, layout);
-    });
-    phases.mark("dedup and person partition");
+    parallel(partition_count, threads, [&](auto, auto bin) { deduplicate(bin, input); });
+    phases.mark("dedup");
+
+    std::vector<EventBatch<Record>> batches(partition_count);
+    {
+        std::vector<std::vector<std::uint32_t>> assignments(threads);
+        parallel(partition_count, threads, [&](auto worker, auto bin) {
+            group_raw_events(bin, input, layout, aliases, assignments[worker], batches[bin]);
+        });
+    }
+    phases.mark("group and resolve event users");
 
     const auto user_dir = out / "user_daily", campaign_dir = out / "campaign_daily";
     fs::create_directories(user_dir);
@@ -265,7 +330,7 @@ void finish(std::vector<Input>& input, const Aliases& aliases, const CandidateLa
         timelines.emplace_back(catalog.categories.size(), catalog.campaigns.size());
     }
     parallel(partition_count, threads, [&](auto worker, auto bin) {
-        process_bin(bin, input, output, clock, timelines[worker], buffers[worker], *writers[worker], totals[worker]);
+        write_person_bin(bin, input, batches, clock, timelines[worker], buffers[worker], *writers[worker], totals[worker]);
     });
     parallel(threads, threads, [&](auto, auto i) { writers[i]->close(i == 0); });
     phases.mark("sort, aggregate and write users");
@@ -287,7 +352,7 @@ void run_pipeline(const fs::path& data, const fs::path& out, unsigned threads, b
     const Clock clock(data / "manifest.json");
     Keys lookup_keys;
     const Catalog catalog(data, scanner, lookup_keys);
-    const CandidateLayout layout{clock.begin, clock.end - clock.begin > UINT32_MAX,
+    const EventLayout layout{clock.begin, clock.end - clock.begin > UINT32_MAX,
                                  catalog.categories.size() > 256};
     const CsvFiles link_files(data / "links");
     const CsvFiles event_files(data / "events"), click_files(data / "clicks");
@@ -303,7 +368,8 @@ void run_pipeline(const fs::path& data, const fs::path& out, unsigned threads, b
     const auto capacity = event_bytes / (threads * partition_count * bytes_per_event);
     if (capacity >= 128) {
         for (auto& worker : input) {
-            for (auto& bin : worker.candidates) bin.reserve(capacity);
+            for (auto& bin : worker.versions) bin.reserve(capacity);
+            for (auto& bin : worker.events) bin.reserve(capacity);
         }
     }
     Keys linked_keys;
@@ -323,7 +389,7 @@ void run_pipeline(const fs::path& data, const fs::path& out, unsigned threads, b
             ingest.clicks(click_files.ranges[job - event_ranges], clock, catalog, link_ready.get(), input[worker]);
         }
     });
-    phases.mark("parse and link IDs");
+    phases.mark("parse and partition");
 
     const auto& aliases = link_ready.get();
     if (layout.wide_time || layout.wide_purchase)

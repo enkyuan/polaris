@@ -195,9 +195,12 @@ Scanner select_scanner() {
 
 Clock::Clock(const fs::path& manifest) {
     const Mapping mapping(manifest);
-    begin = ingest(manifest_field(mapping.bytes(), "window_start"));
-    end = ingest(manifest_field(mapping.bytes(), "window_end"));
-    if (begin == bad_time || end == bad_time || end <= begin) throw std::runtime_error("invalid time window");
+    const auto start_seconds = ingest_seconds(manifest_field(mapping.bytes(), "window_start"));
+    const auto end_seconds = ingest_seconds(manifest_field(mapping.bytes(), "window_end"));
+    if (start_seconds == bad_time || end_seconds == bad_time || end_seconds <= start_seconds)
+        throw std::runtime_error("invalid time window");
+    begin = start_seconds * 1000;
+    end = end_seconds * 1000;
     if (utc_day(end) - utc_day(begin) <= 20) {
         for (auto day = utc_day(begin) - 8; day <= utc_day(end) + 2; ++day) {
             const auto [year, month, date] = days_to_civil(static_cast<int>(day));
@@ -213,9 +216,19 @@ Clock::Clock(const fs::path& manifest) {
     }
 }
 
-Time Clock::ingest(std::string_view value) const {
-    if (value.size() != 20 || value[19] != 'Z') return bad_time;
-    return parse(value);
+int Clock::civil_day(const char* p) const {
+    const auto& cached = nearby_[slot(p)];
+    return cached.prefix == date_prefix(p) && cached.suffix == date_suffix(p)
+        ? cached.utc_day : parse_day(p);
+}
+
+Time Clock::ingest_seconds(std::string_view value) const {
+    if (value.size() != 20 || value[4] != '-' || value[19] != 'Z') return bad_time;
+    const auto* p = value.data();
+    const auto secs = seconds_of_day(p);
+    if (secs < 0) return bad_time;
+    const auto day = civil_day(p);
+    return day == INT32_MIN ? bad_time : static_cast<Time>(day) * (day_ms / 1000) + secs;
 }
 
 Time Clock::parse(std::string_view value) const {
@@ -224,9 +237,7 @@ Time Clock::parse(std::string_view value) const {
     if ((value.size() == 20 || value.size() == 25) && p[4] == '-') {
         const auto secs = seconds_of_day(p);
         if (secs < 0) return bad_time;
-        const auto& cached = nearby_[slot(p)];
-        const auto day = cached.prefix == date_prefix(p) && cached.suffix == date_suffix(p)
-            ? cached.utc_day : parse_day(p);
+        const auto day = civil_day(p);
         if (day == INT32_MIN) return bad_time;
         int offset = 0;
         if (value.size() == 20) {
