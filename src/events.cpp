@@ -295,6 +295,17 @@ void run_pipeline(const fs::path& data, const fs::path& out, unsigned threads, b
 
     std::vector<Input> input(threads);
     const auto event_ranges = event_files.ranges.size();
+    std::size_t event_bytes = 0;
+    for (const auto range : event_files.ranges) event_bytes += range.end - range.begin;
+    // Budget for typical rows with headroom for uneven work assignments.
+    // This only estimates allocation size. The vectors still grow as needed.
+    constexpr std::size_t bytes_per_event = 64;
+    const auto capacity = event_bytes / (threads * partition_count * bytes_per_event);
+    if (capacity >= 128) {
+        for (auto& worker : input) {
+            for (auto& bin : worker.candidates) bin.reserve(capacity);
+        }
+    }
     Keys linked_keys;
     std::promise<Aliases> link_result;
     const auto link_ready = link_result.get_future().share();

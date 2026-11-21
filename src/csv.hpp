@@ -56,7 +56,7 @@ void scan_csv(Range range, Kernel scanner, F&& emit) {
     const auto marker = [&](const char* p, char ch) {
         if (ch == '"') {
             bad = true;
-            return;
+            return false;
         }
         if (count < N && !bad) {
             const auto length = static_cast<std::size_t>(p - field_start);
@@ -67,11 +67,11 @@ void scan_csv(Range range, Kernel scanner, F&& emit) {
         }
         ++count;
         field_start = p + (p != range.end);
-        if (ch == '\n') {
-            if (count == N && !bad) emit(fields);
-            count = 0;
-            bad = false;
-        }
+        if (ch != '\n') return false;
+        const bool complete = count == N && !bad;
+        count = 0;
+        bad = false;
+        return complete;
     };
 
     const auto delimiter = [](char ch) { return ch == ',' || ch == '\n'; };
@@ -89,16 +89,18 @@ void scan_csv(Range range, Kernel scanner, F&& emit) {
         auto mask = delimiters | (quotes & ~adjacent);
         while (mask) {
             const auto offset = std::countr_zero(mask) >> scanner.shift;
-            marker(p + offset, p[offset]);
+            if (marker(p + offset, p[offset])) emit(fields);
             mask &= mask - 1;
         }
         p += scanner.bytes;
     }
     for (; p < range.end; ++p) {
         if (delimiter(*p) || (*p == '"' && p != range.begin && p + 1 != range.end &&
-                             !delimiter(p[-1]) && !delimiter(p[1]))) marker(p, *p);
+                             !delimiter(p[-1]) && !delimiter(p[1]))) {
+            if (marker(p, *p)) emit(fields);
+        }
     }
-    if (field_start != range.end || count) marker(range.end, '\n');
+    if ((field_start != range.end || count) && marker(range.end, '\n')) emit(fields);
 }
 
 class Clock {

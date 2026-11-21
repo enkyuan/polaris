@@ -6,6 +6,17 @@ startup and closing the Parquet output. The Linux/amd64 image is checked
 locally under emulation. A score or runtime on a native N2 machine requires
 a run on that hardware.
 
+## Leaderboard baseline
+
+The reported practice score for the published candidate
+`eeb4e126ec482f257ffbb58422c215caf147a2f3` is **1.47 s**. Reaching the
+last reported lead of 1.24 s requires saving 0.23 s, or 15.6% of this
+runtime. Taking the lead requires a score below 1.24 s.
+
+The 1.12 s local M1 median used a generated dataset. The leaderboard score
+covers the hidden dataset from container start to exit. The leaderboard
+result alone cannot identify the time spent in each phase.
+
 ## Implementation decisions
 
 | Change | Why it helps and how correctness is preserved |
@@ -108,3 +119,81 @@ measurements as separate observations. Run the fixtures and exact public
 dev check for each candidate before using its timing to choose a submission.
 The Docker harness wall time includes CLI and cleanup. Use container
 start and exit timestamps for a comparison at the scorer's timing boundary.
+
+## Profile function and system costs
+
+An Instruments Time Profiler run on the native M1 build captured 6,669
+running-thread samples on the generated 20M-event seed-17 input. The input
+was read immediately before the recording. Both tables matched the
+previous run on the same input.
+
+| Stage | Share of running-thread samples |
+| --- | ---: |
+| Event CSV ingestion | 40.1% |
+| Click CSV ingestion | 12.7% |
+| Linked-ID resolution | 5.3% |
+| Event deduplication and person partitioning | 24.1% |
+| Person grouping, sorting, aggregation, and user Parquet | 16.2% |
+| Remaining samples | 1.6% |
+
+Event ingestion included 220 samples in the copy path reached when an
+event candidate bucket grows. Across event and click ingestion, 310
+samples had `Clock::parse` as the executing frame. These are sampled CPU
+shares. They exclude time waiting for input and cannot explain a
+leaderboard wall-time difference on their own.
+
+On native N2, build with release optimizations and debug symbols. Set
+`DATA_DIR` to the generated input. Run the executable under the matching
+CPU affinity and memory limits. Use a fresh writable output directory for
+each run. Compare default SIMD and `CSV_SIMD=avx2` with the same input,
+affinity, and cache conditions.
+
+```sh
+cmake -S . -B build-trace -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS=-g
+cmake --build build-trace --parallel
+
+NCPU=8 POLARIS_TIMINGS=1 OUTPUT_DIR="$(mktemp -d)" \
+  perf stat -e task-clock,cycles,instructions,branch-misses,cache-misses,minor-faults,major-faults \
+  -- ./build-trace/shopping-sessions
+
+NCPU=8 POLARIS_TIMINGS=1 OUTPUT_DIR="$(mktemp -d)" \
+  perf record -F 499 --call-graph dwarf -- ./build-trace/shopping-sessions
+perf report --stdio
+```
+
+If the VM does not expose hardware counters, use a software event such as
+`cpu-clock` for sampling and keep the fault counters that are available.
+Profile the executable directly so the samples belong to the workload.
+
+## Trace-guided ingestion changes
+
+The delimiter loop now reports when a complete row is ready. The scanner
+only calls typed decoding at that point. This lets the compiler inline
+the work done for each delimiter without also inlining the row decoder
+into that operation. The same quote and field-count checks still apply
+to each row, including the range tail.
+
+Pre-size the event candidate vectors from the input byte count. The
+estimate budgets 64 input bytes per candidate and divides the capacity
+across the workers and event-ID buckets. A vector can still grow if a
+worker receives a larger share of the input. The estimate affects
+allocation only.
+
+The follow-up M1 trace used the same 20M-event input. Event ingestion
+accounted for 2,232 of 6,409 running-thread samples, down from 2,671 of
+6,669. The first trace showed 220 samples in candidate growth copies.
+The follow-up sampled none. Both output tables matched exactly.
+
+In a five-run interleaved comparison on the M1, the warm seed-17 median
+went from 0.99 s to 0.97 s. Median user CPU time fell from 5.93 s to
+5.45 s. The fastest selected run took 0.91 s and the slowest took
+2.07 s. The smaller wall-time change and the spread matter when
+interpreting the CPU savings.
+
+I also tested fixed-size candidate blocks, collecting delimiters before
+decoding all fields at row end, and a dedicated UTC ingest-timestamp
+path. Those variants did not show a repeatable end-to-end improvement
+over the selected change in the local comparisons. The Linux/amd64
+image and the native M1 build passed the organizer fixtures, the four
+record-layout checks, and the public dev comparison. Native N2 timing
+still needs a run on that hardware.
